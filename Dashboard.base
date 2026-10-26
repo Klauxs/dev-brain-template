@@ -1,0 +1,47 @@
+properties:
+  file.name:
+    displayName: 笔记
+  note.project:
+    displayName: 项目
+  note.status:
+    displayName: 状态
+  note.kind:
+    displayName: 类型
+views:
+  - type: table
+    name: 项目总览
+    filters:
+      and:
+        - note.kind == "hub"
+    order:
+      - file.name
+      - project
+      - status
+    sort:
+      - property: file.name
+        direction: ASC
+    columnSize:
+      file.name: 360
+  - type: table
+    name: 待核实
+    filters:
+      and:
+        - note.status == "verify-needed"
+    order:
+      - file.name
+      - project
+      - kind
+    sort:
+      - property: file.name
+        direction: ASC
+    columnSize:
+      file.name: 420
+  - type: table
+    name: 收件箱
+    filters:
+      and:
+        - file.inFolder("inbox")
+    order:
+      - file.name
+      - project
+      - status

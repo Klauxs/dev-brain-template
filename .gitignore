@@ -1,0 +1,7 @@
+.obsidian/workspace*
+.obsidian/cache
+.trash/
+.DS_Store
+.*.sw?
+# archify 视觉校验产物，可再生
+*.visual-check.*

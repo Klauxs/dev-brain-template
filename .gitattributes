@@ -1,0 +1,2 @@
+# Hubs carry an append-only live record; keep both sides when two machines append at once.
+_hub.md merge=union

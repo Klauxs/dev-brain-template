@@ -1,0 +1,573 @@
+#!/bin/zsh
+# dev-brain curator runner: drains the local handoff queue with a fresh headless
+# Codex session per batch, commits exactly the paths Codex reports, and syncs the
+# vault with Git. See _system/curator-session.md.
+set -euo pipefail
+
+script_path="${0:A}"
+vault="${DEV_BRAIN_VAULT:-${script_path:h:h:h}}"
+config_file="${DEV_BRAIN_CURATOR_CONFIG:-$HOME/.config/dev-brain/curator.env}"
+if [[ -f "$config_file" ]]; then
+  set -a
+  source "$config_file"
+  set +a
+fi
+
+queue_dir="${DEV_BRAIN_HANDOFF_QUEUE:-$HOME/.codex/dev-brain-curator-queue}"
+codex_bin="${CODEX_BIN:-codex}"
+model="${DEV_BRAIN_CURATOR_MODEL:-gpt-6.1-sol}"
+effort="${DEV_BRAIN_CURATOR_EFFORT:-medium}"
+batch_size="${DEV_BRAIN_CURATOR_BATCH:-5}"
+run_timeout="${DEV_BRAIN_CURATOR_TIMEOUT:-1800}"
+lock_wait="${DEV_BRAIN_CURATOR_LOCK_WAIT:-900}"
+max_attempts="${DEV_BRAIN_CURATOR_MAX_ATTEMPTS:-3}"
+interval="${DEV_BRAIN_CURATOR_INTERVAL:-3600}"
+notify="${DEV_BRAIN_CURATOR_NOTIFY:-1}"
+keep_runs="${DEV_BRAIN_CURATOR_KEEP_RUNS:-60}"
+autosave_idle="${DEV_BRAIN_CURATOR_AUTOSAVE_IDLE:-7200}"
+label="dev.brain.curator"
+plist="${DEV_BRAIN_CURATOR_PLIST:-$HOME/Library/LaunchAgents/$label.plist}"
+schema="$vault/_system/curator-output.schema.json"
+lock_dir="$queue_dir/.worker.lock"
+
+have_lock=0
+run_id=""
+run_log="/dev/null"
+sync_result="not run"
+typeset -a commits=() autosaved=()
+typeset -A counts=(done 0 skipped 0 deferred 0 failed 0 duplicate 0)
+
+usage() {
+  cat <<'EOF'
+Usage:
+  dev-brain-curator run        Process pending handoffs until the queue is empty, then sync Git.
+  dev-brain-curator sync       Only sync the vault with its upstream (pull --rebase, push).
+  dev-brain-curator status     Show queue counts, lock, launchd state and the last run.
+  dev-brain-curator install    Install and load the launchd agent (queue watcher + hourly run).
+  dev-brain-curator uninstall  Unload and remove the launchd agent.
+
+Configuration: ~/.config/dev-brain/curator.env (KEY=value lines), e.g.
+  DEV_BRAIN_CURATOR_MODEL=gpt-6.1-sol
+  DEV_BRAIN_CURATOR_EFFORT=medium
+EOF
+}
+
+die() {
+  print -u2 -r -- "$*"
+  exit 64
+}
+
+note() {
+  print -r -- "$(date '+%F %T') $*" >> "$run_log"
+}
+
+ensure_dirs() {
+  mkdir -p "$queue_dir"/{pending,running,done,failed,logs,attempts}
+}
+
+notify_user() {
+  [[ "$notify" == 1 ]] || return 0
+  command -v osascript >/dev/null 2>&1 || return 0
+  local message="${1//\"/\'}"
+  osascript -e "display notification \"$message\" with title \"dev-brain curator\"" >/dev/null 2>&1 || true
+}
+
+lock_is_stale() {
+  local pid mtime
+  pid="$(sed -n '1p' "$lock_dir/pid" 2>/dev/null || true)"
+  if [[ "$pid" == <-> ]] && kill -0 "$pid" 2>/dev/null; then
+    return 1
+  fi
+  mtime="$(stat -f %m "$lock_dir" 2>/dev/null || stat -c %Y "$lock_dir" 2>/dev/null || print 0)"
+  (( $(date +%s) - mtime > 30 ))
+}
+
+requeue_running() {
+  local f
+  for f in "$queue_dir"/running/*.txt(N); do
+    mv "$f" "$queue_dir/pending/${f:t}"
+  done
+  for f in "$queue_dir"/running/*.sha256(N); do
+    rm -f "$f"
+  done
+}
+
+acquire_lock() {
+  local waited=0
+  until mkdir "$lock_dir" 2>/dev/null; do
+    if lock_is_stale; then
+      rm -rf "$lock_dir"
+      continue
+    fi
+    if (( waited >= lock_wait )); then
+      return 1
+    fi
+    sleep 2
+    waited=$(( waited + 2 ))
+  done
+  print -r -- "$$" > "$lock_dir/pid"
+  {
+    print -r -- "pid=$$"
+    print -r -- "holder=dev-brain-curator"
+    print -r -- "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$lock_dir/meta"
+  have_lock=1
+}
+
+release_lock() {
+  if (( have_lock )); then
+    rm -rf "$lock_dir"
+    have_lock=0
+  fi
+}
+
+begin_run() {
+  ensure_dirs
+  run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  run_log="$queue_dir/logs/run-$run_id.log"
+  if ! acquire_lock; then
+    print -r -- "$(date '+%F %T') run=$run_id skipped: another curator run held the lock for ${lock_wait}s" >> "$queue_dir/logs/runs.log"
+    exit 75
+  fi
+}
+
+attempts_file() {
+  print -r -- "$queue_dir/attempts/$1"
+}
+
+finish_job() {
+  local id="$1" result="$2" reason="$3"
+  local job="$queue_dir/running/$id.txt"
+  local attempts
+  case "$result" in
+    done|skipped)
+      mv "$job" "$queue_dir/done/$id.txt"
+      mv "$queue_dir/running/$id.sha256" "$queue_dir/done/$id.sha256" 2>/dev/null || true
+      print -r -- "$result	$reason	run=$run_id	commit=${commits[-1]:-}" > "$queue_dir/done/$id.result"
+      rm -f "$(attempts_file "$id")"
+      ;;
+    failed)
+      mv "$job" "$queue_dir/failed/$id.txt"
+      rm -f "$queue_dir/running/$id.sha256"
+      print -r -- "failed	$reason	run=$run_id" > "$queue_dir/failed/$id.result"
+      rm -f "$(attempts_file "$id")"
+      ;;
+    *)
+      attempts=$(( $(cat "$(attempts_file "$id")" 2>/dev/null || print 0) + 1 ))
+      rm -f "$queue_dir/running/$id.sha256"
+      if (( attempts >= max_attempts )); then
+        mv "$job" "$queue_dir/failed/$id.txt"
+        print -r -- "failed	gave up after $attempts attempts: $reason	run=$run_id" > "$queue_dir/failed/$id.result"
+        rm -f "$(attempts_file "$id")"
+        result="failed"
+      else
+        print -r -- "$attempts" > "$(attempts_file "$id")"
+        mv "$job" "$queue_dir/pending/$id.txt"
+        result="deferred"
+      fi
+      ;;
+  esac
+  counts[$result]=$(( ${counts[$result]} + 1 ))
+  note "job $id -> $result: $reason"
+}
+
+build_prompt() {
+  local id
+  print -r -- "你是 dev-brain 的 curator，工作目录是库根 $vault。"
+  print -r -- "先完整阅读 _system/rules.md 和 _system/curator-session.md，再按 curator-session.md「每次运行的处理流程」处理下面这批 handoff（共 $# 条）。"
+  print -r -- "提交和 Git 同步由外部执行器完成：不要运行任何会修改 .git 的命令；移动文件用 mv，并在 changed_paths 里同时列出旧路径和新路径。"
+  print -r -- "开始前看一眼 git status：tasks/、issues/ 之外如果有上一次 curator 运行中断留下的未提交改动，先检查，再决定补完还是撤回，并把这些路径也列进 changed_paths。"
+  print -r -- "最终回复按给定的 JSON schema 输出，jobs 里每条 handoff 一项，id 原样照抄。"
+  for id in "$@"; do
+    print -r -- ""
+    print -r -- "===== handoff id: $id ====="
+    cat "$queue_dir/running/$id.txt"
+  done
+}
+
+parse_result() {
+  python3 - "$vault" "$@" <<'PY'
+import json
+import os
+import sys
+
+vault, result_file, *ids = sys.argv[1:]
+try:
+    with open(result_file, encoding="utf-8") as fh:
+        res = json.load(fh)
+except Exception as exc:  # unreadable or missing result
+    print(f"ERROR\t{exc}")
+    sys.exit(2)
+
+def flat(text):
+    return " ".join(str(text).split())
+
+jobs = {j.get("id"): j for j in res.get("jobs", []) if isinstance(j, dict)}
+for job_id in ids:
+    job = jobs.get(job_id)
+    if job is None:
+        print(f"JOB\t{job_id}\tdeferred\tmissing from curator result")
+    else:
+        print(f"JOB\t{job_id}\t{job.get('result', 'deferred')}\t{flat(job.get('reason', ''))}")
+
+seen = set()
+for raw in res.get("changed_paths", []):
+    raw = str(raw).strip()
+    if not raw:
+        continue
+    full = os.path.normpath(raw if os.path.isabs(raw) else os.path.join(vault, raw))
+    rel = os.path.relpath(full, vault)
+    parts = rel.split(os.sep)
+    if rel == "." or rel.startswith("..") or parts[0] == ".git":
+        print(f"SKIP\t{raw}\toutside the vault")
+    elif len(parts) > 2 and parts[0] == "projects" and parts[2] in ("tasks", "issues"):
+        print(f"SKIP\t{rel}\towned by a work session")
+    elif rel not in seen:
+        seen.add(rel)
+        print(f"PATH\t{rel}")
+
+print(f"MSG\t{flat(res.get('commit_message', '')) or '整理 handoff'}")
+print(f"SUMMARY\t{flat(res.get('summary', ''))}")
+PY
+}
+
+commit_paths() {
+  local message="$1"
+  shift
+  local -a keep=()
+  local p attempt
+  for p in "$@"; do
+    if [[ -e "$vault/$p" ]] || git -C "$vault" cat-file -e "HEAD:$p" 2>/dev/null; then
+      keep+=("$p")
+    else
+      note "ignored path that neither exists nor is tracked: $p"
+    fi
+  done
+  (( ${#keep} )) || return 0
+  for attempt in 1 2 3 4 5; do
+    if git -C "$vault" add -A -- "${keep[@]}" >> "$run_log" 2>&1; then
+      break
+    fi
+    if (( attempt == 5 )); then
+      return 1
+    fi
+    sleep 2
+  done
+  if git -C "$vault" diff --cached --quiet -- "${keep[@]}"; then
+    return 0
+  fi
+  for attempt in 1 2 3 4 5; do
+    if git -C "$vault" commit -q -m "curator: $message" -- "${keep[@]}" >> "$run_log" 2>&1; then
+      commits+=("$(git -C "$vault" rev-parse --short HEAD)")
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+process_batch() {
+  local -a ids=() done_hashes=()
+  local name id hash prior
+  for name in "$@"; do
+    id="${name:r}"
+    hash="$(shasum -a 256 "$queue_dir/pending/$name" | cut -d' ' -f1)"
+    prior=""
+    done_hashes=( "$queue_dir"/done/*.sha256(N) )
+    if (( ${#done_hashes} )); then
+      prior="$(grep -lx -- "$hash" "${done_hashes[@]}" | head -n 1 || true)"
+    fi
+    if [[ -n "$prior" ]]; then
+      mv "$queue_dir/pending/$name" "$queue_dir/done/$name"
+      print -r -- "duplicate	same content as ${prior:t:r}	run=$run_id" > "$queue_dir/done/$id.result"
+      counts[duplicate]=$(( ${counts[duplicate]} + 1 ))
+      note "job $id -> duplicate of ${prior:t:r}"
+      continue
+    fi
+    mv "$queue_dir/pending/$name" "$queue_dir/running/$name"
+    print -r -- "$hash" > "$queue_dir/running/$id.sha256"
+    ids+=("$id")
+  done
+  (( ${#ids} )) || return 0
+
+  local batch_id="$run_id-$(( ++batch_seq ))"
+  local prompt="$queue_dir/logs/run-$batch_id.prompt.md"
+  local result="$queue_dir/logs/run-$batch_id.result.json"
+  local events="$queue_dir/logs/run-$batch_id.jsonl"
+  build_prompt "${ids[@]}" > "$prompt"
+  note "batch $batch_id: ${#ids} handoff(s) with $model/$effort"
+
+  local -a codex_args=(
+    exec --ignore-user-config --ephemeral --sandbox workspace-write
+    -C "$vault" -m "$model" -c "model_reasoning_effort=$effort"
+    --output-schema "$schema" -o "$result" --json -
+  )
+  local rc=0
+  perl -e 'alarm shift; exec @ARGV' "$run_timeout" "$codex_bin" "${codex_args[@]}" \
+    < "$prompt" > "$events" 2> "${events:r}.stderr" || rc=$?
+
+  local parsed
+  if (( rc != 0 )) || ! parsed="$(parse_result "$result" "${ids[@]}")"; then
+    note "batch $batch_id: codex exit $rc or unreadable result; handoffs go back to pending"
+    for id in "${ids[@]}"; do
+      finish_job "$id" deferred "codex run failed (exit $rc), see logs/run-$batch_id.*"
+    done
+    return 1
+  fi
+
+  local -a paths=()
+  local message="整理 handoff" kind a b c line
+  while IFS= read -r line; do
+    kind="${line%%	*}"
+    case "$kind" in
+      PATH) paths+=("${line#PATH	}") ;;
+      MSG) message="${line#MSG	}" ;;
+      SKIP) note "not committed: ${line#SKIP	}" ;;
+    esac
+  done <<< "$parsed"
+
+  if ! commit_paths "$message" "${paths[@]}"; then
+    note "batch $batch_id: commit failed; handoffs go back to pending"
+    for id in "${ids[@]}"; do
+      finish_job "$id" deferred "commit failed, see logs/run-$batch_id.*"
+    done
+    return 1
+  fi
+
+  while IFS= read -r line; do
+    [[ "$line" == JOB* ]] || continue
+    IFS=$'\t' read -r kind a b c <<< "$line"
+    finish_job "$a" "$b" "$c"
+  done <<< "$parsed"
+  return 0
+}
+
+sync_vault() {
+  local gitdir conflicts attempt behind ahead dirty
+  gitdir="$(git -C "$vault" rev-parse --absolute-git-dir)"
+  if [[ -d "$gitdir/rebase-merge" || -d "$gitdir/rebase-apply" || -f "$gitdir/MERGE_HEAD" ]]; then
+    sync_result="deferred: rebase or merge in progress"
+    return 0
+  fi
+  if ! git -C "$vault" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+    sync_result="skipped: no upstream branch"
+    return 0
+  fi
+  export GIT_TERMINAL_PROMPT=0
+  export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o ConnectTimeout=15}"
+  for attempt in 1 2 3; do
+    if ! git -C "$vault" fetch --quiet >> "$run_log" 2>&1; then
+      sync_result="failed: fetch, see ${run_log:t}"
+      return 0
+    fi
+    behind="$(git -C "$vault" rev-list --count 'HEAD..@{u}')"
+    ahead="$(git -C "$vault" rev-list --count '@{u}..HEAD')"
+    if (( behind > 0 )); then
+      # Rebasing rewrites the working tree, so it needs tracked files to be clean.
+      # Pushing alone does not, which is why a session's unfinished edits only
+      # block sync when the remote has moved.
+      dirty="$(git -C "$vault" status --porcelain --untracked-files=no | cut -c4- | tr '\n' ' ')"
+      if [[ -n "$dirty" ]]; then
+        sync_result="deferred: remote has new commits and tracked files are modified: ${dirty% }"
+        return 0
+      fi
+      if ! git -C "$vault" rebase --quiet '@{u}' >> "$run_log" 2>&1; then
+        if [[ -d "$gitdir/rebase-merge" || -d "$gitdir/rebase-apply" ]]; then
+          conflicts="$(git -C "$vault" diff --name-only --diff-filter=U | tr '\n' ' ')"
+          git -C "$vault" rebase --abort >> "$run_log" 2>&1 || true
+          sync_result="blocked: conflict in ${conflicts% }"
+          notify_user "同步冲突，需要处理：${conflicts% }"
+        else
+          sync_result="failed: rebase, see ${run_log:t}"
+        fi
+        return 0
+      fi
+      ahead="$(git -C "$vault" rev-list --count '@{u}..HEAD')"
+    fi
+    if (( ahead == 0 )); then
+      sync_result="ok: up to date"
+      return 0
+    fi
+    if git -C "$vault" push --quiet >> "$run_log" 2>&1; then
+      sync_result="ok: pushed"
+      return 0
+    fi
+  done
+  sync_result="failed: push rejected 3 times"
+}
+
+prune_logs() {
+  local -a old=( "$queue_dir"/logs/run-*.log(Nom) )
+  local f
+  (( ${#old} > keep_runs )) || return 0
+  for f in "${old[@]:$keep_runs}"; do
+    rm -f "${f%.log}"*(N)
+  done
+}
+
+summarize() {
+  local line
+  line="$(date '+%F %T') run=$run_id model=$model/$effort done=${counts[done]} skipped=${counts[skipped]} duplicate=${counts[duplicate]} deferred=${counts[deferred]} failed=${counts[failed]} autosaved=${#autosaved} commits=${(j:,:)commits} sync=$sync_result"
+  print -r -- "$line" >> "$queue_dir/logs/runs.log"
+  print -r -- "$line" > "$queue_dir/logs/last-run.txt"
+  print -r -- "$line"
+  note "$line"
+  if (( ${counts[failed]} > 0 )) || [[ "$sync_result" == failed:* ]]; then
+    notify_user "有 handoff 处理失败或同步失败，见 dev-brain-curator status"
+  fi
+  prune_logs
+}
+
+# Commits session-owned directories (task records, issue workbenches, diagrams)
+# that have uncommitted changes but have not been touched for autosave_idle
+# seconds. Sessions are supposed to commit at their checkpoints; this catches the
+# ones that stopped early or committed only part of their directory.
+autosave_sessions() {
+  local now line rel dir newest mtime f
+  local -A dirs=()
+  local -a files
+  now="$(date +%s)"
+  while IFS= read -r -d '' line; do
+    rel="${line[4,-1]}"
+    if [[ "$rel" =~ '^(projects/[^/]+/(tasks|issues)/[^/]+)/' ]]; then
+      dir="${match[1]}"
+    elif [[ "$rel" =~ '^(projects/[^/]+/diagrams)/' ]]; then
+      dir="${match[1]}"
+    else
+      continue
+    fi
+    dirs[$dir]=1
+  done < <(git -C "$vault" status --porcelain -z --untracked-files=all)
+  for dir in ${(k)dirs}; do
+    newest=0
+    files=( "$vault/$dir"/**/*(N.) )
+    for f in "${files[@]}"; do
+      mtime="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f")"
+      (( mtime > newest )) && newest=$mtime
+    done
+    if (( now - newest < autosave_idle )); then
+      note "autosave: $dir still active, skipped"
+      continue
+    fi
+    git -C "$vault" add -A -- "$dir" >> "$run_log" 2>&1 || continue
+    if git -C "$vault" diff --cached --quiet -- "$dir"; then
+      continue
+    fi
+    if git -C "$vault" commit -q -m "autosave: ${dir} (会话未提交，curator 补提交)" -- "$dir" >> "$run_log" 2>&1; then
+      commits+=("$(git -C "$vault" rev-parse --short HEAD)")
+      autosaved+=("$dir")
+    fi
+  done
+}
+
+cmd_run() {
+  [[ -f "$schema" ]] || die "missing schema: $schema"
+  begin_run
+  requeue_running
+  typeset -g batch_seq=0
+  local -a batch
+  while true; do
+    batch=( "$queue_dir"/pending/*.txt(N:t) )
+    (( ${#batch} )) || break
+    batch=( "${(@)batch[1,$batch_size]}" )
+    process_batch "${batch[@]}" || break
+  done
+  autosave_sessions
+  sync_vault
+  summarize
+}
+
+cmd_sync() {
+  begin_run
+  sync_vault
+  print -r -- "sync: $sync_result"
+  [[ "$sync_result" == ok:* || "$sync_result" == skipped:* ]]
+}
+
+count_bucket() {
+  local -a files=( "$queue_dir/$1"/*.txt(N) )
+  print -r -- "${#files}"
+}
+
+cmd_status() {
+  ensure_dirs
+  local pid=""
+  print -r -- "vault: $vault"
+  print -r -- "queue: $queue_dir"
+  print -r -- "pending: $(count_bucket pending)  running: $(count_bucket running)  done: $(count_bucket done)  failed: $(count_bucket failed)"
+  if [[ -d "$lock_dir" ]]; then
+    pid="$(sed -n '1p' "$lock_dir/pid" 2>/dev/null || true)"
+    if [[ "$pid" == <-> ]] && kill -0 "$pid" 2>/dev/null; then
+      print -r -- "lock: held by running pid $pid"
+    else
+      print -r -- "lock: stale (pid ${pid:-unknown}); the next run recovers it"
+    fi
+  else
+    print -r -- "lock: free"
+  fi
+  print -r -- "model: $model / $effort"
+  if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+    print -r -- "launchd: loaded ($plist)"
+  else
+    print -r -- "launchd: not loaded (run: dev-brain-curator install)"
+  fi
+  print -r -- "last run: $(cat "$queue_dir/logs/last-run.txt" 2>/dev/null || print none)"
+}
+
+cmd_install() {
+  local codex_path
+  codex_path="$(command -v "$codex_bin")" || die "codex executable not found: $codex_bin"
+  ensure_dirs
+  mkdir -p "${plist:h}"
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key>
+  <array><string>$script_path</string><string>run</string></array>
+  <key>WatchPaths</key>
+  <array><string>$queue_dir/pending</string></array>
+  <key>StartInterval</key><integer>$interval</integer>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>${codex_path:h}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>CODEX_BIN</key><string>$codex_path</string>
+  </dict>
+  <key>StandardOutPath</key><string>$queue_dir/logs/launchd.log</string>
+  <key>StandardErrorPath</key><string>$queue_dir/logs/launchd.log</string>
+</dict>
+</plist>
+EOF
+  plutil -lint "$plist" >/dev/null
+  launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$(id -u)" "$plist"
+  print -r -- "installed: $plist"
+  print -r -- "watches: $queue_dir/pending; hourly fallback every ${interval}s; model $model / $effort"
+}
+
+cmd_uninstall() {
+  launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+  rm -f "$plist"
+  print -r -- "uninstalled: $plist"
+}
+
+# zsh runs an EXIT trap set inside a function when that function returns, so the
+# lock-release traps live at script level.
+trap 'release_lock' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+case "${1:-}" in
+  run) cmd_run ;;
+  sync) cmd_sync ;;
+  status) cmd_status ;;
+  install) cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  -h|--help|help|"") usage ;;
+  *) usage >&2; exit 64 ;;
+esac

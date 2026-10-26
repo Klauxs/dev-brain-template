@@ -1,0 +1,181 @@
+#!/bin/zsh
+# Queue a dev-brain handoff for the local curator. Processing happens in
+# _system/bin/dev-brain-curator, which launchd starts when pending/ changes.
+set -euo pipefail
+
+queue_dir="${DEV_BRAIN_HANDOFF_QUEUE:-$HOME/.codex/dev-brain-curator-queue}"
+stale_minutes="${DEV_BRAIN_HANDOFF_STALE_MINUTES:-30}"
+mode="enqueue"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  dev-brain-handoff [--queue-dir DIR] < handoff.txt   Queue a handoff (first line must be "dev-brain handoff").
+  dev-brain-handoff --status [--queue-dir DIR]        Print queue counts and the curator lock.
+  dev-brain-handoff --recover-stale [--stale-minutes N] [--queue-dir DIR]
+                                                      Requeue running jobs left by a dead curator run.
+
+The curator itself is _system/bin/dev-brain-curator (run, status, install).
+EOF
+}
+
+die() {
+  echo "$*" >&2
+  exit 64
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --queue-dir)
+      [[ $# -ge 2 ]] || die "--queue-dir requires a value"
+      queue_dir="$2"
+      shift 2
+      ;;
+    --queue-dir=*)
+      queue_dir="${1#*=}"
+      shift
+      ;;
+    --enqueue-only)
+      # Kept for older callers; queuing is the only enqueue behavior.
+      shift
+      ;;
+    --recover-stale)
+      mode="recover"
+      shift
+      ;;
+    --stale-minutes)
+      [[ $# -ge 2 ]] || die "--stale-minutes requires a value"
+      stale_minutes="$2"
+      shift 2
+      ;;
+    --stale-minutes=*)
+      stale_minutes="${1#*=}"
+      shift
+      ;;
+    --status)
+      mode="status"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown option: $1"
+      ;;
+  esac
+done
+
+lock="$queue_dir/.worker.lock"
+
+ensure_queue_dirs() {
+  mkdir -p "$queue_dir"/{pending,running,done,failed,logs}
+}
+
+lock_pid() {
+  [[ -f "$lock/pid" ]] || return 1
+  sed -n '1p' "$lock/pid"
+}
+
+pid_is_alive() {
+  [[ "$1" == <-> ]] || return 1
+  kill -0 "$1" 2>/dev/null
+}
+
+new_job_id() {
+  printf '%s-%s-%s' "$(date -u +%Y%m%dT%H%M%SZ)" "$$" "$RANDOM"
+}
+
+enqueue_handoff() {
+  ensure_queue_dirs
+
+  local job_id incoming first_line
+  job_id="$(new_job_id)"
+  incoming="$queue_dir/.incoming-$job_id.txt"
+
+  cat > "$incoming"
+
+  first_line="$(sed -n '/[^[:space:]]/{p;q;}' "$incoming")"
+  if [[ "$first_line" != "dev-brain handoff" ]]; then
+    mv "$incoming" "$queue_dir/failed/$job_id.txt"
+    echo "not a dev-brain handoff: $queue_dir/failed/$job_id.txt" >&2
+    exit 2
+  fi
+
+  mv "$incoming" "$queue_dir/pending/$job_id.txt"
+  echo "queued: $job_id"
+}
+
+requeue_running_jobs() {
+  local running dest
+  for running in "$queue_dir"/running/*.txt(N); do
+    dest="$queue_dir/pending/${running:t}"
+    [[ -e "$dest" ]] && dest="$queue_dir/pending/${running:t:r}-recovered.txt"
+    mv "$running" "$dest"
+  done
+}
+
+recover_stale() {
+  ensure_queue_dirs
+
+  if [[ ! -d "$lock" ]]; then
+    local running_jobs=( "$queue_dir"/running/*.txt(N) )
+    if (( ${#running_jobs[@]} > 0 )); then
+      requeue_running_jobs
+      echo "recovered orphaned running jobs"
+    else
+      echo "no worker lock"
+    fi
+    return 0
+  fi
+
+  local pid=""
+  pid="$(lock_pid 2>/dev/null || true)"
+  if [[ -n "$pid" ]] && pid_is_alive "$pid"; then
+    echo "curator still running: pid $pid"
+    return 1
+  fi
+
+  local mtime age stale_seconds
+  mtime="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock")"
+  age=$(( $(date +%s) - mtime ))
+  stale_seconds=$(( stale_minutes * 60 ))
+  if (( age < stale_seconds )); then
+    echo "worker lock is not stale yet: age=${age}s threshold=${stale_seconds}s"
+    return 1
+  fi
+
+  requeue_running_jobs
+  rm -rf "$lock"
+  echo "recovered stale worker lock: age=${age}s"
+}
+
+count_bucket() {
+  find "$queue_dir/$1" -type f -name '*.txt' 2>/dev/null | wc -l | tr -d ' '
+}
+
+print_status() {
+  ensure_queue_dirs
+  echo "queue: $queue_dir"
+  echo "pending: $(count_bucket pending)"
+  echo "running: $(count_bucket running)"
+  echo "done: $(count_bucket done)"
+  echo "failed: $(count_bucket failed)"
+  if [[ -d "$lock" ]]; then
+    local pid=""
+    pid="$(lock_pid 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && pid_is_alive "$pid"; then
+      echo "lock: present pid=$pid alive=1"
+    else
+      echo "lock: present pid=${pid:-unknown} alive=0"
+    fi
+  else
+    echo "lock: absent"
+  fi
+}
+
+case "$mode" in
+  enqueue) enqueue_handoff ;;
+  recover) recover_stale ;;
+  status) print_status ;;
+esac

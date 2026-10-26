@@ -1,0 +1,38 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["jobs", "changed_paths", "commit_message", "summary"],
+  "properties": {
+    "jobs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "result", "actions", "reason"],
+        "properties": {
+          "id": { "type": "string" },
+          "result": { "type": "string", "enum": ["done", "skipped", "deferred", "failed"] },
+          "actions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["action", "path"],
+              "properties": {
+                "action": {
+                  "type": "string",
+                  "enum": ["新建", "佐证", "补充", "纠错", "升ok", "标verify-needed", "上升", "提炼", "合并", "归档", "更新hub", "其他"]
+                },
+                "path": { "type": "string" }
+              }
+            }
+          },
+          "reason": { "type": "string" }
+        }
+      }
+    },
+    "changed_paths": { "type": "array", "items": { "type": "string" } },
+    "commit_message": { "type": "string" },
+    "summary": { "type": "string" }
+  }
+}
